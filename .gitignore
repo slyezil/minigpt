@@ -1,0 +1,7 @@
+/checkpoints
+/.venv
+/.sf
+/.pytest_cache
+/docs
+/tests/__pycache__
+/src/__pycache__

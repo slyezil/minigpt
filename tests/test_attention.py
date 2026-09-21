@@ -1,7 +1,7 @@
 import torch
 
 from src.attention import RotaryEmbedding
-from src.attention import CasualSelfAttention
+from src.attention import CausalSelfAttention
 from src.config import ModelConfig
 
 

@@ -3,6 +3,9 @@ import torch
 from src.config import ModelConfig
 from src.model import MiniGPT
 from src.train import next_token_loss, train_step
+import math
+
+from src.train import get_learning_rate
 
 
 def test_train_step_updates_model_parameters():
@@ -58,3 +61,58 @@ def test_train_step_updates_model_parameters():
     assert isinstance(loss, float)
     assert torch.isfinite(torch.tensor(loss))
     assert not torch.equal(before, after)
+
+def test_learning_rate_starts_at_zero():
+    lr = get_learning_rate(
+        step=0,
+        warmup_steps=100,
+        total_steps=1000,
+        max_lr=3e-4,
+        min_lr=3e-5,
+    )
+
+    assert lr == 0.0
+
+
+def test_learning_rate_reaches_max_after_warmup():
+    lr = get_learning_rate(
+        step=100,
+        warmup_steps=100,
+        total_steps=1000,
+        max_lr=3e-4,
+        min_lr=3e-5,
+    )
+
+    assert math.isclose(
+        lr,
+        3e-4,
+        rel_tol=1e-6,
+    )
+
+
+def test_learning_rate_decays_to_minimum():
+    lr = get_learning_rate(
+        step=1000,
+        warmup_steps=100,
+        total_steps=1000,
+        max_lr=3e-4,
+        min_lr=3e-5,
+    )
+
+    assert math.isclose(
+        lr,
+        3e-5,
+        rel_tol=1e-6,
+    )
+
+
+def test_learning_rate_is_between_min_and_max_during_decay():
+    lr = get_learning_rate(
+        step=550,
+        warmup_steps=100,
+        total_steps=1000,
+        max_lr=3e-4,
+        min_lr=3e-5,
+    )
+
+    assert 3e-5 < lr < 3e-4

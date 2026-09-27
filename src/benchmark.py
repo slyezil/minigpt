@@ -1,242 +1,289 @@
-import argparse
+from dataclasses import dataclass
+import statistics
 import time
 
 import torch
 
-from src.config import ModelConfig
-from src.dataset import TokenDataset
-from src.model import MiniGPT
-from src.train import next_token_loss
+
+@dataclass
+class BenchmarkResult:
+    prompt_tokens: int
+    generated_tokens: int
+    total_tokens: int
+
+    total_generation_seconds: float
+
+    tokens_per_second: float
+
+    first_token_latency_ms: float
+    mean_token_latency_ms: float
+    p50_token_latency_ms: float
+    p95_token_latency_ms: float
+
+    token_latencies_ms: list[float]
+
+    output_ids: torch.Tensor
 
 
-def benchmark_batch_size(
-    model: MiniGPT,
-    dataset: TokenDataset,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    batch_size: int,
-    context_length: int,
-    warmup_steps: int = 2,
-    benchmark_steps: int = 5,
-) -> float:
-    model.train()
+def synchronize_device(device: torch.device) -> None:
+    """
+    Synchronize asynchronous device execution before/after timing.
 
-    total_steps = warmup_steps + benchmark_steps
-    measured_time = 0.0
+    CPU operations are synchronous, so nothing is required there.
+    """
 
-    for step in range(total_steps):
-        inputs, targets = dataset.get_batch(
-            batch_size=batch_size,
-            device=device,
+    if device.type == "xpu":
+        torch.xpu.synchronize()
+
+
+def extract_logits(model_output):
+    """
+    Support a few common model output formats.
+
+    Our MiniGPT currently returns logits directly, but keeping this helper
+    makes the benchmark reusable.
+    """
+
+    if isinstance(model_output, torch.Tensor):
+        return model_output
+
+    if hasattr(model_output, "logits"):
+        return model_output.logits
+
+    if isinstance(model_output, (tuple, list)):
+        return model_output[0]
+
+    raise TypeError(
+        f"Unsupported model output type: {type(model_output)}"
+    )
+
+
+def percentile(values: list[float], percentile_value: float) -> float:
+    """
+    Simple percentile implementation without requiring NumPy.
+    """
+
+    if not values:
+        return 0.0
+
+    sorted_values = sorted(values)
+
+    index = int(
+        round(
+            (len(sorted_values) - 1)
+            * percentile_value
+        )
+    )
+
+    return sorted_values[index]
+
+
+def benchmark_naive_generation(
+    model,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int = 64,
+    warmup_runs: int = 3,
+    use_autocast: bool = True,
+) -> BenchmarkResult:
+
+    if prompt_ids.ndim != 2:
+        raise ValueError(
+            "prompt_ids must have shape [batch_size, sequence_length]"
         )
 
-        optimizer.zero_grad(set_to_none=True)
+    if prompt_ids.shape[0] != 1:
+        raise ValueError(
+            "Initial benchmark currently expects batch_size=1"
+        )
 
-        if step >= warmup_steps:
-            torch.xpu.synchronize()
+    device = prompt_ids.device
+
+    model.eval()
+
+    #
+    # ---------------------------------------------------------
+    # Warmup
+    # ---------------------------------------------------------
+    #
+    # The first few GPU/XPU calls can include kernel initialization
+    # overhead. We do not want that contaminating the benchmark.
+    #
+
+    with torch.inference_mode():
+
+        for _ in range(warmup_runs):
+
+            if device.type == "xpu" and use_autocast:
+
+                with torch.autocast(
+                    device_type="xpu",
+                    dtype=torch.bfloat16,
+                ):
+                    _ = model(prompt_ids)
+
+            else:
+
+                _ = model(prompt_ids)
+
+        synchronize_device(device)
+
+    #
+    # ---------------------------------------------------------
+    # Actual benchmark
+    # ---------------------------------------------------------
+    #
+
+    tokens = prompt_ids.clone()
+
+    token_latencies_ms = []
+
+    with torch.inference_mode():
+
+        for _ in range(max_new_tokens):
+
+            synchronize_device(device)
+
             start = time.perf_counter()
 
-        # BF16 compute on the Intel Arc GPU.
-        with torch.autocast(
-            device_type="xpu",
-            dtype=torch.bfloat16,
-        ):
-            logits = model(inputs)
+            if device.type == "xpu" and use_autocast:
 
-            loss = next_token_loss(
-                logits,
-                targets,
+                with torch.autocast(
+                    device_type="xpu",
+                    dtype=torch.bfloat16,
+                ):
+                    output = model(tokens)
+
+            else:
+
+                output = model(tokens)
+
+            logits = extract_logits(output)
+
+            #
+            # Only use the final position to select the next token.
+            #
+            # IMPORTANT:
+            #
+            # This does NOT yet optimize the LM head.
+            #
+            # The model still computed logits for every position.
+            #
+            # We are only selecting the final position here.
+            #
+
+            next_token_logits = logits[:, -1, :]
+
+            next_token = torch.argmax(
+                next_token_logits,
+                dim=-1,
+                keepdim=True,
             )
 
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=1.0,
-        )
-
-        optimizer.step()
-
-        if step >= warmup_steps:
-            torch.xpu.synchronize()
-
-            measured_time += (
-                time.perf_counter() - start
+            tokens = torch.cat(
+                [tokens, next_token],
+                dim=1,
             )
 
-    tokens_processed = (
-        benchmark_steps
-        * batch_size
-        * context_length
+            synchronize_device(device)
+
+            end = time.perf_counter()
+
+            latency_ms = (
+                end - start
+            ) * 1000.0
+
+            token_latencies_ms.append(
+                latency_ms
+            )
+
+    total_generation_seconds = (
+        sum(token_latencies_ms) / 1000.0
     )
 
     tokens_per_second = (
-        tokens_processed / measured_time
+        max_new_tokens
+        / total_generation_seconds
     )
 
-    return tokens_per_second
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--data",
-        default="data/train.bin",
+    first_token_latency_ms = (
+        token_latencies_ms[0]
     )
 
-    parser.add_argument(
-        "--batch-sizes",
-        type=int,
-        nargs="+",
-        default=[1, 2, 4, 8],
+    mean_token_latency_ms = statistics.mean(
+        token_latencies_ms
     )
 
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=2,
+    p50_token_latency_ms = percentile(
+        token_latencies_ms,
+        0.50,
     )
 
-    parser.add_argument(
-        "--benchmark-steps",
-        type=int,
-        default=5,
+    p95_token_latency_ms = percentile(
+        token_latencies_ms,
+        0.95,
     )
 
-    args = parser.parse_args()
+    return BenchmarkResult(
+        prompt_tokens=prompt_ids.shape[1],
+        generated_tokens=max_new_tokens,
+        total_tokens=tokens.shape[1],
 
-    if not torch.xpu.is_available():
-        raise RuntimeError(
-            "Intel XPU is not available."
-        )
+        total_generation_seconds=total_generation_seconds,
 
-    device = torch.device("xpu")
+        tokens_per_second=tokens_per_second,
 
-    config = ModelConfig()
+        first_token_latency_ms=first_token_latency_ms,
+        mean_token_latency_ms=mean_token_latency_ms,
+        p50_token_latency_ms=p50_token_latency_ms,
+        p95_token_latency_ms=p95_token_latency_ms,
 
+        token_latencies_ms=token_latencies_ms,
+
+        output_ids=tokens,
+    )
+def print_benchmark(result: BenchmarkResult) -> None:
     print()
-    print("MiniGPT Arc Benchmark")
-    print("=====================")
+    print("=" * 60)
+    print("MiniGPT Inference Benchmark")
+    print("=" * 60)
+
+    print(f"Prompt tokens:              {result.prompt_tokens}")
+    print(f"Generated tokens:           {result.generated_tokens}")
+    print(f"Total sequence tokens:      {result.total_tokens}")
+
+    print("-" * 60)
+
     print(
-        f"Device:        "
-        f"{torch.xpu.get_device_name(0)}"
+        f"Total generation time:      "
+        f"{result.total_generation_seconds:.6f} s"
     )
+
     print(
-        f"Parameters:    "
-        f"{config.estimated_parameter_count:,}"
+        f"Generation throughput:      "
+        f"{result.tokens_per_second:.2f} tok/s"
     )
+
+    print("-" * 60)
+
     print(
-        f"Context:       "
-        f"{config.context_length}"
+        f"First token latency:        "
+        f"{result.first_token_latency_ms:.2f} ms"
     )
+
     print(
-        f"Precision:     BF16 autocast"
+        f"Mean token latency:         "
+        f"{result.mean_token_latency_ms:.2f} ms"
     )
+
+    print(
+        f"P50 token latency:          "
+        f"{result.p50_token_latency_ms:.2f} ms"
+    )
+
+    print(
+        f"P95 token latency:          "
+        f"{result.p95_token_latency_ms:.2f} ms"
+    )
+
+    print("=" * 60)
     print()
-
-    dataset = TokenDataset(
-        path=args.data,
-        context_length=config.context_length,
-    )
-
-    results = []
-
-    for batch_size in args.batch_sizes:
-        print(
-            f"Testing batch size "
-            f"{batch_size}..."
-        )
-
-        try:
-            # Create a fresh model for every batch-size test
-            # so each run starts under comparable conditions.
-            model = MiniGPT(
-                config
-            ).to(device)
-
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=3e-4,
-                weight_decay=0.1,
-            )
-
-            tokens_per_second = (
-                benchmark_batch_size(
-                    model=model,
-                    dataset=dataset,
-                    optimizer=optimizer,
-                    device=device,
-                    batch_size=batch_size,
-                    context_length=(
-                        config.context_length
-                    ),
-                    warmup_steps=(
-                        args.warmup_steps
-                    ),
-                    benchmark_steps=(
-                        args.benchmark_steps
-                    ),
-                )
-            )
-
-            results.append(
-                (
-                    batch_size,
-                    tokens_per_second,
-                )
-            )
-
-            print(
-                f"  {tokens_per_second:,.0f} "
-                f"tokens/sec"
-            )
-
-            del optimizer
-            del model
-
-            torch.xpu.empty_cache()
-
-        except RuntimeError as exc:
-            message = str(exc).lower()
-
-            if (
-                "out of memory" in message
-                or "memory" in message
-            ):
-                print(
-                    "  OUT OF MEMORY"
-                )
-
-                torch.xpu.empty_cache()
-
-                break
-
-            raise
-
-    print()
-    print("Results")
-    print("=======")
-
-    for (
-        batch_size,
-        tokens_per_second,
-    ) in results:
-        tokens_in_8_hours = (
-            tokens_per_second
-            * 60
-            * 60
-            * 8
-        )
-
-        print(
-            f"Batch {batch_size:>2}: "
-            f"{tokens_per_second:>8,.0f} "
-            f"tok/s | "
-            f"~{tokens_in_8_hours / 1_000_000:,.1f}M "
-            f"tokens / 8h"
-        )
-
-
-if __name__ == "__main__":
-    main()
